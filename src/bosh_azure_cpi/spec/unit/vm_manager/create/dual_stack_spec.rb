@@ -8,6 +8,8 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
 
   subject(:vm_manager_ds) { vm_manager2 }
 
+  let(:load_balancer_service) { Bosh::AzureCloud::LoadBalancerService.new(azure_client) }
+  let(:configured_load_balancers) { nil }
   let(:dual_stack_subnet) { double('dual-stack-subnet', id: 'fake-dual-stack-subnet-id') }
 
   let(:manual_network_v4) { build_manual_network(private_ip: '10.0.0.5', subnet_name: 'dual-stack-subnet') }
@@ -45,12 +47,12 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
     end
   end
 
-  def capture_nic_params
+  def capture_nic_params(load_balancers: configured_load_balancers)
     captured = []
     allow(azure_client).to receive(:create_network_interface) { |_rg, params| captured << params }
     vm_manager_ds.send(:_create_network_interfaces,
                        MOCK_RESOURCE_GROUP_NAME, vm_name, location,
-                       vm_props, network_configurator)
+                       vm_props, network_configurator, load_balancers: load_balancers)
     captured.sort_by { |params| params[:name] }
   end
 
@@ -88,6 +90,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
   end
 
   context 'when a load balancer contains both NIC-based and IP-based pools' do
+    let(:configured_load_balancers) { [mixed_load_balancer] }
     let(:nic_pool) { { name: 'nic-pool', backend_address_pools_type: 'nic' } }
     let(:ip_pool) { { name: 'ip-pool', backend_address_pools_type: 'ip' } }
     let(:nic_pool_v6) { { name: 'nic-pool-v6', backend_address_pools_type: 'nic' } }
@@ -101,7 +104,6 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
     end
 
     before do
-      allow(vm_manager_ds).to receive(:_get_load_balancers).and_return([mixed_load_balancer])
       allow(network_configurator).to receive(:nic_groups).and_return([[manual_network_v4, manual_network_v6]])
     end
 
@@ -134,9 +136,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
     end
 
     it 'forwards nil without marking the NIC for cleanup when no load balancers are configured' do
-      allow(vm_manager_ds).to receive(:_get_load_balancers).and_return(nil)
-
-      nic = capture_nic_params.first
+      nic = capture_nic_params(load_balancers: nil).first
 
       expect(nic[:load_balancers]).to be_nil
       expect(nic[:tags]).not_to have_key(Bosh::AzureCloud::Helpers::LOAD_BALANCER_USED_BY_TAG)
@@ -148,9 +148,8 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
       other = first.merge(id: 'other-lb-id')
       inputs = [first, second, first, other]
       original = Marshal.load(Marshal.dump(inputs))
-      allow(vm_manager_ds).to receive(:_get_load_balancers).and_return(inputs)
 
-      nic = capture_nic_params.first
+      nic = capture_nic_params(load_balancers: inputs).first
 
       expect(nic[:load_balancers]).to eq(original)
       expect(nic[:tags][Bosh::AzureCloud::Helpers::LOAD_BALANCER_USED_BY_TAG]).to eq('true')
@@ -174,6 +173,8 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
   end
 
   context 'when there are multiple nic_groups and the first one is dual-stack' do
+    let(:configured_load_balancers) { [load_balancer] }
+
     before do
       allow(network_configurator).to receive(:nic_groups)
         .and_return([[manual_network_v4, manual_network_v6], [dynamic_net]])
@@ -278,7 +279,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
     end
   end
 
-  describe '#_get_load_balancers' do
+  describe 'load balancer service pool selection' do
     let(:backend_pool_name_v6) { 'pool-v6' }
     let(:pool_v4) { { name: 'pool-v4', id: 'pool-v4-id' } }
     let(:pool_v6) { { name: 'pool-v6', id: 'pool-v6-id' } }
@@ -304,7 +305,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
         .with(MOCK_RESOURCE_GROUP_NAME, 'fake-lb-name')
         .and_return(load_balancer)
 
-      result = vm_manager_ds.send(:_get_load_balancers, vm_props)
+      result = load_balancer_service.load_balancers(vm_props)
 
       expect(result).to match([
         a_hash_including(
@@ -321,7 +322,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
 
       it 'raises a cloud error naming the missing pool' do
         expect do
-          vm_manager_ds.send(:_get_load_balancers, vm_props)
+          load_balancer_service.load_balancers(vm_props)
         end.to raise_error(
           Bosh::Clouds::CloudError,
           /does not have a backend_pool named 'missing-v6-pool'/
@@ -330,7 +331,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
     end
   end
 
-  describe '#_add_vm_to_load_balancer_backend_pool' do
+  describe 'load balancer service dual-stack registration' do
     let(:vnet_id) { '/subscriptions/fake-subscription/resourceGroups/fake-resource-group/providers/Microsoft.Network/virtualNetworks/fake-vnet' }
     let(:virtual_machine_result) do
       {
@@ -372,7 +373,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
 
     it 'adds each VM address to its matching IP-based pool and skips NIC-based pools' do
       allow(SecureRandom).to receive(:uuid).and_return('ipv4-address', 'ipv6-address')
-      allow(vm_manager_ds).to receive(:flock).and_yield
+      allow(load_balancer_service).to receive(:flock).and_yield
       allow(azure_client).to receive(:get_load_balancer_by_name)
         .with('fake-resource-group', 'fake-lb-name')
         .and_return(
@@ -399,11 +400,7 @@ describe Bosh::AzureCloud::VMManager, 'dual-stack NIC creation' do
         )
         .ordered
 
-      vm_manager_ds.send(
-        :_add_vm_to_load_balancer_backend_pool,
-        load_balancers,
-        virtual_machine_result
-      )
+      load_balancer_service.add_vm(load_balancers, virtual_machine_result[:network_interfaces])
     end
   end
 

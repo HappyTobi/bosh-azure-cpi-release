@@ -10,6 +10,7 @@ describe Bosh::AzureCloud::VMManager do
     let(:agent_util) { instance_double(Bosh::AzureCloud::BoshAgentUtil) }
     let(:network_spec) { {} }
     let(:config) { instance_double(Bosh::AzureCloud::Config) }
+    let(:load_balancer_service) { vm_manager.instance_variable_get(:@load_balancer_service) }
 
     before do
       allow(vm_manager).to receive(:_get_stemcell_info).and_return(stemcell_info)
@@ -26,13 +27,13 @@ describe Bosh::AzureCloud::VMManager do
       end
 
       before do
-        allow(vm_manager).to receive(:_get_load_balancers).and_return([load_balancer])
+        allow(load_balancer_service).to receive(:load_balancers).with(vm_props).and_return([load_balancer])
         allow(azure_client).to receive(:create_virtual_machine).and_return(virtual_machine_result)
       end
 
       it 'rolls back registered backend addresses before deleting network interfaces' do
-        expect(vm_manager).to receive(:_add_vm_to_load_balancer_backend_pool)
-          .with([load_balancer], virtual_machine_result)
+        expect(load_balancer_service).to receive(:add_vm)
+          .with([load_balancer], virtual_machine_result[:network_interfaces])
           .ordered
           .and_raise('backend pool update failed')
         expect(vm_manager).to receive(:_remove_vm_from_load_balancer_backend_pool)
@@ -43,6 +44,20 @@ describe Bosh::AzureCloud::VMManager do
         expect do
           vm_manager.create(bosh_vm_meta, location, vm_props, disk_cids, network_configurator, env, agent_util, network_spec, config)
         end.to raise_error(/backend pool update failed/)
+      end
+    end
+
+    context 'when VM creation returns no result' do
+      before do
+        allow(vm_manager).to receive(:_create_virtual_machine).and_return(nil)
+      end
+
+      it 'does not register load balancer backend addresses or dereference the missing result' do
+        expect(load_balancer_service).not_to receive(:add_vm)
+
+        expect do
+          vm_manager.create(bosh_vm_meta, location, vm_props, disk_cids, network_configurator, env, agent_util, network_spec, config)
+        end.not_to raise_error
       end
     end
 
@@ -95,7 +110,7 @@ describe Bosh::AzureCloud::VMManager do
           task_count = 0
           allow(Concurrent::Future).to receive(:execute).and_wrap_original do |original, &block|
             task_count += 1
-            if task_count == 4
+            if task_count == 3
               expect(network_interface_names).to eq(["#{vm_name}-0"])
               nic_task
             else
@@ -108,7 +123,7 @@ describe Bosh::AzureCloud::VMManager do
           expect(nic_task).to receive(:wait)
 
           expect do
-            vm_manager.send(:_create_network_interfaces, MOCK_RESOURCE_GROUP_NAME, vm_name, location, vm_props, network_configurator, network_interface_names: network_interface_names)
+            vm_manager.send(:_create_network_interfaces, MOCK_RESOURCE_GROUP_NAME, vm_name, location, vm_props, network_configurator, load_balancers: load_balancer_service.load_balancers(vm_props), network_interface_names: network_interface_names)
           end.to raise_error(/security group lookup failed/)
           expect(network_interface_names).to eq(["#{vm_name}-0"])
         end

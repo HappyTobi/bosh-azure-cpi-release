@@ -14,6 +14,7 @@ module Bosh::AzureCloud
       @stemcell_manager2 = stemcell_manager2
       @light_stemcell_manager = light_stemcell_manager
       @instance_type_mapper = instance_type_mapper || InstanceTypeMapper.new(azure_client)
+      @load_balancer_service = LoadBalancerService.new(azure_client)
       @use_managed_disks = azure_config.use_managed_disks
       @logger = Bosh::Clouds::Config.logger
     end
@@ -91,6 +92,9 @@ module Bosh::AzureCloud
 
       @logger.info("The instance type is '#{vm_props.instance_type}'")
 
+      # Load the list of all load balancers from the Azure client
+      load_balancers = @load_balancer_service.load_balancers(vm_props)
+
       # tasks to prepare resources for VM
       #   * prepare stemcell
       #   * prepare network interfaces, including public IP, NICs, LB, AG, etc
@@ -110,13 +114,7 @@ module Bosh::AzureCloud
           primary_nic_tags = AZURE_TAGS.dup
           # Store the availability set name in the tags of the NIC
           primary_nic_tags['availability_set'] = availability_set_name unless availability_set_name.nil?
-          _create_network_interfaces(resource_group_name, vm_name, location, vm_props, network_configurator, primary_nic_tags, network_interface_names: network_interface_names)
-        end
-      )
-
-      tasks.push(
-        task_load_balancer = Concurrent::Future.execute do
-          _get_load_balancers(vm_props)
+          _create_network_interfaces(resource_group_name, vm_name, location, vm_props, network_configurator, primary_nic_tags, load_balancers: load_balancers, network_interface_names: network_interface_names)
         end
       )
 
@@ -140,7 +138,6 @@ module Bosh::AzureCloud
 
       stemcell_info = task_get_stemcell_info.value!
       network_interfaces = task_create_network_interfaces.value!
-      load_balancers = task_load_balancer.value!
       availability_set = task_get_or_create_availability_set.value!
       diagnostics_storage_account = task_get_diagnostics_storage_account.value!
 
@@ -230,8 +227,8 @@ module Bosh::AzureCloud
       end
 
       # Add virtual machine to the load balancer backend pool if load balancer pool is ip based and the load balancer pool exists.
-      unless load_balancers.nil? || load_balancers.empty?
-        _add_vm_to_load_balancer_backend_pool(load_balancers, virtual_machine_result)
+      unless (load_balancers.nil? || load_balancers.empty?) || (virtual_machine_result.nil? || virtual_machine_result[:network_interfaces].nil? || virtual_machine_result[:network_interfaces].empty?)
+        @load_balancer_service.add_vm(load_balancers,virtual_machine_result[:network_interfaces])
       end
 
       [instance_id, vm_params]

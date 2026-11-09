@@ -69,6 +69,7 @@ require 'cloud/azure/models/vm_cloud_props'
 require 'cloud/azure/cloud'
 require 'cloud/azure/restapi/azure_client'
 require 'cloud/azure/restapi/azure_client_param_builder'
+require 'cloud/azure/loadbalancer/load_balancer_service'
 
 require 'cloud/azure/network/network'
 require 'cloud/azure/network/manual_network'

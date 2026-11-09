@@ -3,8 +3,10 @@
 require 'spec_helper'
 require 'unit/vm_manager/create/shared_stuff'
 
-describe Bosh::AzureCloud::VMManager do
+describe Bosh::AzureCloud::LoadBalancerService, 'VM backend pool integration' do
   include_context 'shared stuff for vm manager'
+
+  let(:load_balancer_service) { described_class.new(azure_client) }
 
   let(:vnet_id) do
     '/subscriptions/fake-subscription/resourceGroups/fake-resource-group/providers/Microsoft.Network/virtualNetworks/fake-vnet'
@@ -12,7 +14,7 @@ describe Bosh::AzureCloud::VMManager do
 
   describe '#_build_backend_address' do
     it 'builds an Azure backend address with the supplied VM name' do
-      backend_address = vm_manager.send(:_build_backend_address, {}, 'fake-vm', '10.0.0.5', vnet_id)
+      backend_address = load_balancer_service.send(:_build_backend_address, {}, 'fake-vm', '10.0.0.5', vnet_id)
 
       expect(backend_address).to eq(
         name: 'fake-vm',
@@ -26,7 +28,7 @@ describe Bosh::AzureCloud::VMManager do
     it 'generates a name when the VM name is omitted' do
       allow(SecureRandom).to receive(:uuid).and_return('generated-uuid')
 
-      backend_address = vm_manager.send(:_build_backend_address, {}, '', 'fd00::5', vnet_id)
+      backend_address = load_balancer_service.send(:_build_backend_address, {}, '', 'fd00::5', vnet_id)
 
       expect(backend_address[:name]).to eq('generated-uuid')
     end
@@ -87,7 +89,7 @@ describe Bosh::AzureCloud::VMManager do
     it 'builds addresses for IP-based pools and skips NIC-based pools, empty or nil IPs, and secondary NICs' do
       allow(SecureRandom).to receive(:uuid).and_return('ipv4-address', 'ipv6-address')
 
-      result = vm_manager.send(
+      result = load_balancer_service.send(
         :_calculate_backend_addresses_for_load_balancer,
         load_balancer,
         vm_network_interfaces
@@ -123,7 +125,7 @@ describe Bosh::AzureCloud::VMManager do
       }
       allow(SecureRandom).to receive(:uuid).and_return('first-ipv4', 'second-ipv4', 'ipv6')
 
-      result = vm_manager.send(
+      result = load_balancer_service.send(
         :_calculate_backend_addresses_for_load_balancer,
         load_balancer,
         vm_network_interfaces
@@ -144,7 +146,7 @@ describe Bosh::AzureCloud::VMManager do
 
     it 'omits pools that have no matching VM addresses' do
       expect(
-        vm_manager.send(
+        load_balancer_service.send(
           :_calculate_backend_addresses_for_load_balancer,
           load_balancer,
           [{ primary: true, ip_configurations: [] }]
@@ -154,7 +156,7 @@ describe Bosh::AzureCloud::VMManager do
 
     it 'returns no backend addresses when the VM has no primary NIC' do
       expect(
-        vm_manager.send(
+        load_balancer_service.send(
           :_calculate_backend_addresses_for_load_balancer,
           load_balancer,
           [{ primary: false, ip_configurations: [] }]
@@ -166,7 +168,7 @@ describe Bosh::AzureCloud::VMManager do
       load_balancer[:backend_address_pools_v6] = nil
       allow(SecureRandom).to receive(:uuid).and_return('ipv4-address')
 
-      result = vm_manager.send(
+      result = load_balancer_service.send(
         :_calculate_backend_addresses_for_load_balancer,
         load_balancer,
         vm_network_interfaces
@@ -186,13 +188,13 @@ describe Bosh::AzureCloud::VMManager do
     end
   end
 
-  describe '#_add_vm_to_load_balancer_backend_pool' do
+  describe '#add_vm' do
     let(:resource_group_name) { 'fake-resource-group' }
     let(:load_balancers) { [{ name: 'fake-lb', resource_group_name: resource_group_name }] }
     let(:virtual_machine_result) { { name: 'fake-vm-name', network_interfaces: [{ ip_configurations: [] }] } }
 
     before do
-      allow(vm_manager).to receive(:flock).and_yield
+      allow(load_balancer_service).to receive(:flock).and_yield
     end
 
     context 'with a real creation result parsed without extended resources' do
@@ -284,17 +286,18 @@ describe Bosh::AzureCloud::VMManager do
               end
           end
 
-          vm_manager.send(:_add_vm_to_load_balancer_backend_pool, [configured_load_balancer], created_vm)
+          load_balancer_service.add_vm([configured_load_balancer], created_vm[:network_interfaces])
         end
       end
     end
 
-    it 'does nothing when the VM result or load balancers are absent' do
+    it 'does nothing when network interfaces or load balancers are absent' do
       expect(azure_client).not_to receive(:get_load_balancer_by_name)
 
-      vm_manager.send(:_add_vm_to_load_balancer_backend_pool, nil, virtual_machine_result)
-      vm_manager.send(:_add_vm_to_load_balancer_backend_pool, [], virtual_machine_result)
-      vm_manager.send(:_add_vm_to_load_balancer_backend_pool, load_balancers, nil)
+      load_balancer_service.add_vm(nil, virtual_machine_result[:network_interfaces])
+      load_balancer_service.add_vm([], virtual_machine_result[:network_interfaces])
+      load_balancer_service.add_vm(load_balancers, nil)
+      load_balancer_service.add_vm(load_balancers, [])
     end
 
     it 'preserves identical IPs in different virtual networks and deduplicates exact IP and virtual network pairs' do
@@ -316,7 +319,7 @@ describe Bosh::AzureCloud::VMManager do
           'virtualNetwork' => { 'id' => "#{vnet_id}-other" }
         }
       }
-      allow(vm_manager).to receive(:_calculate_backend_addresses_for_load_balancer)
+      allow(load_balancer_service).to receive(:_calculate_backend_addresses_for_load_balancer)
         .with(load_balancers.first, virtual_machine_result[:network_interfaces])
         .and_return([{ name: 'pool-v4', loadBalancerBackendAddresses: [new_address] }])
       expect(azure_client).to receive(:get_load_balancer_by_name)
@@ -330,7 +333,7 @@ describe Bosh::AzureCloud::VMManager do
           { name: other_vnet_address['name'], properties: other_vnet_address['properties'] }
         ])
 
-      vm_manager.send(:_add_vm_to_load_balancer_backend_pool, load_balancers, virtual_machine_result)
+      load_balancer_service.add_vm(load_balancers, virtual_machine_result[:network_interfaces])
     end
 
     it 'deduplicates subnet-based endpoints and preserves unknown or different networks during registration' do
@@ -363,7 +366,7 @@ describe Bosh::AzureCloud::VMManager do
         },
         { 'name' => 'unknown-network', 'properties' => { 'ipAddress' => '10.0.0.5' } }
       ]
-      allow(vm_manager).to receive(:_calculate_backend_addresses_for_load_balancer)
+      allow(load_balancer_service).to receive(:_calculate_backend_addresses_for_load_balancer)
         .with(load_balancers.first, virtual_machine_result[:network_interfaces])
         .and_return([{ name: 'pool-v4', loadBalancerBackendAddresses: [new_address] }])
       expect(azure_client).to receive(:get_load_balancer_by_name)
@@ -376,7 +379,7 @@ describe Bosh::AzureCloud::VMManager do
           { name: address['name'], properties: address['properties'] }
         end)
 
-      vm_manager.send(:_add_vm_to_load_balancer_backend_pool, load_balancers, virtual_machine_result)
+      load_balancer_service.add_vm(load_balancers, virtual_machine_result[:network_interfaces])
     end
 
     it 'merges existing addresses and updates the matching pool under a lock' do
@@ -405,10 +408,10 @@ describe Bosh::AzureCloud::VMManager do
         properties: { 'ipAddress' => '10.0.0.4', 'virtualNetwork' => { 'id' => vnet_id } }
       }
 
-      allow(vm_manager).to receive(:_calculate_backend_addresses_for_load_balancer)
+      allow(load_balancer_service).to receive(:_calculate_backend_addresses_for_load_balancer)
         .with(load_balancers.first, virtual_machine_result[:network_interfaces])
         .and_return(calculated_pools)
-      expect(vm_manager).to receive(:flock)
+      expect(load_balancer_service).to receive(:flock)
         .with("#{Bosh::AzureCloud::Helpers::CPI_LOCK_LOAD_BALANCER}-all", File::LOCK_EX)
         .and_yield
       expect(azure_client).to receive(:get_load_balancer_by_name)
@@ -417,11 +420,7 @@ describe Bosh::AzureCloud::VMManager do
       expect(azure_client).to receive(:update_load_balancer_backend_pool)
         .with(resource_group_name, 'fake-lb', 'pool-v4', [new_address, rebuilt_existing_address])
 
-      vm_manager.send(
-        :_add_vm_to_load_balancer_backend_pool,
-        load_balancers,
-        virtual_machine_result
-      )
+      load_balancer_service.add_vm(load_balancers, virtual_machine_result[:network_interfaces])
     end
   end
 
